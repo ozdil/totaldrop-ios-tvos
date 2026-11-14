@@ -26,6 +26,13 @@ use totaldrop_core::{
 use totaldrop_l10n::{Arg, Domain, Strings};
 use totaldrop_proto::{SafePath, TransferCode, chunk_count, limits, validate_path};
 
+pub mod handoff;
+
+pub use handoff::{
+    BackgroundTaskGuard, HandoffError, MAX_HANDOFF_JSON_BYTES, SystemExpirationReport,
+    parse_background_checkpoint_json, parse_ios_share_manifest_json,
+};
+
 /// App Group identifier shared between `TotalDropIOS` and `ShareExtension`.
 pub const IOS_APP_GROUP_ID: &str = "group.app.totaldrop.ios";
 
@@ -199,10 +206,21 @@ impl IosShareManifest {
                 })
             })
             .collect();
+        let skipped_items: Vec<Value> = self
+            .skipped
+            .iter()
+            .map(|(original_name, reason)| {
+                json!({
+                    "originalName": original_name,
+                    "reason": handoff::skip_reason_slug(reason),
+                })
+            })
+            .collect();
         json!({
             "appGroup": self.app_group,
             "totalBytes": self.total_bytes,
             "skippedCount": self.skipped.len(),
+            "skipped": skipped_items,
             "notice": self.localized_notice,
             "rejectedBusy": self.rejected_busy,
             "entries": items,
@@ -857,6 +875,9 @@ pub async fn prepare_mobile_send(
     staged_files: Vec<PathBuf>,
     token: &MobileStopToken,
 ) -> totaldrop_core::Result<PreparedSend> {
+    if token.is_cancelled() {
+        return Err(CoreError::Stopped);
+    }
     let opts = config.send_options();
     tokio::select! {
         biased;
@@ -875,6 +896,9 @@ pub async fn connect_mobile_receive(
     code_or_link: &str,
     token: &MobileStopToken,
 ) -> totaldrop_core::Result<IncomingOffer> {
+    if token.is_cancelled() {
+        return Err(CoreError::Stopped);
+    }
     let code = TransferCode::from_link(code_or_link)
         .ok_or(CoreError::Code(totaldrop_proto::CodeError::BadNameplate))?;
     IncomingOffer::connect_with(
