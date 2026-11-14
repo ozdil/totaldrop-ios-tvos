@@ -1,0 +1,22 @@
+/target
+/.build
+/**/.build
+/**/.swiftpm
+/DerivedData
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.swp
+.DS_Store
+
+# Built Apple mobile frameworks and archives
+dist/
+*.xcframework/
+*.xcarchive/
+*.ipa
+*.app/
+*.appex/
+*.dSYM/
+
+# Python bytecode
+__pycache__/
+*.pyc
