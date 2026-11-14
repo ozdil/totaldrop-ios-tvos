@@ -17,6 +17,8 @@ path = [
   "crates/totaldrop-core/**",
   "crates/totaldrop-l10n/**",
   "l10n/**",
+  "ui-swiftui-ios/Resources/**",
+  "ui-swiftui-tvos/Resources/**",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "2026 The TotalDrop Contributors"

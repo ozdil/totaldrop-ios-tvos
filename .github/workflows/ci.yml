@@ -61,11 +61,13 @@ jobs:
         run: cargo build --release --locked -p totaldrop-apple-mobile-bridge --target aarch64-apple-ios-sim
       - name: Build Rust bridge (iOS Simulator x86_64)
         run: cargo build --release --locked -p totaldrop-apple-mobile-bridge --target x86_64-apple-ios
-      - name: Validate Apple mobile packaging shell scripts
+      - name: Validate Apple mobile packaging scripts, 35-locale xcstrings & 6 subplatform units
         run: |
           for script in target-*/*.sh; do
             bash -n "$script"
           done
+          python3 -c 'import json; assert len(json.load(open("ui-swiftui-ios/Resources/Localizable.xcstrings"))["strings"]["verificationTitle"]["localizations"]) == 35; assert len(json.load(open("ui-swiftui-tvos/Resources/Localizable.xcstrings"))["strings"]["verificationTitle"]["localizations"]) == 35'
+          python3 tools/verify-subplatforms.py
 
   deny:
     name: Dependencies (cargo-deny)
