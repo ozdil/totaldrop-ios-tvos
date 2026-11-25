@@ -164,11 +164,17 @@ jobs:
           echo "Using available iPhone Simulator UDID: ${SIM_UDID} (Rust target: ${SIM_RUST_TARGET})"
           (
             cd "${ROOT_DIR}/ui-swiftui-ios"
+            TEST_SCHEME="TotalDropIOS"
+            if xcodebuild -list | grep -qx '[[:space:]]*TotalDropIOS-Package'; then
+              TEST_SCHEME="TotalDropIOS-Package"
+            fi
+            echo "Running Swift 6 + live Rust FFI tests via scheme: ${TEST_SCHEME}"
             xcodebuild test \
-              -scheme TotalDropIOS \
+              -scheme "${TEST_SCHEME}" \
+              -only-testing:TotalDropIOSTests \
               -destination "platform=iOS Simulator,id=${SIM_UDID}" \
               CODE_SIGNING_ALLOWED=NO \
-              OTHER_LDFLAGS="\$(inherited) -L${ROOT_DIR}/target/${SIM_RUST_TARGET}/release -ltotaldrop_apple_mobile_ffi"
+              OTHER_LDFLAGS="\$(inherited) -L${ROOT_DIR}/target/${SIM_RUST_TARGET}/release -ltotaldrop_apple_mobile_ffi -framework Security -framework SystemConfiguration -framework CoreFoundation"
           )
 
   deny:

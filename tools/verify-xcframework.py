@@ -169,15 +169,25 @@ def verify_xcframework(
                     f"slice {slice_id}: lipo -archs {sorted(actual_archs)} != {sorted(expected_archs)}"
                 )
 
-            nm_out = subprocess.check_output(
-                ["nm", "-gU", str(lib_path)], text=True, stderr=subprocess.DEVNULL
-            )
-            exported = parse_nm_exported_symbols(nm_out)
-            missing_syms = [s for s in REQUIRED_EXPORTED_SYMBOLS if s not in exported]
-            if missing_syms:
-                raise ValueError(
-                    f"slice {slice_id}: missing exported C ABI symbols: {', '.join(missing_syms)}"
+            for arch in sorted(expected_archs):
+                nm_proc = subprocess.run(
+                    ["nm", "-gU", "-arch", arch, str(lib_path)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
                 )
+                if not nm_proc.stdout.strip():
+                    raise ValueError(
+                        f"slice {slice_id} ({arch}): nm -gU produced no symbol output "
+                        f"(rc={nm_proc.returncode}, stderr={nm_proc.stderr.strip()!r})"
+                    )
+                exported = parse_nm_exported_symbols(nm_proc.stdout)
+                missing_syms = [s for s in REQUIRED_EXPORTED_SYMBOLS if s not in exported]
+                if missing_syms:
+                    raise ValueError(
+                        f"slice {slice_id} ({arch}): missing exported C ABI symbols: "
+                        f"{', '.join(missing_syms)}"
+                    )
 
         verified_slices.append(f"{slice_id}({','.join(sorted(expected_archs))})")
 
