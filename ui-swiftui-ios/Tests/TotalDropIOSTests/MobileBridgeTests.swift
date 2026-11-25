@@ -37,6 +37,7 @@ struct MobileBridgeTests {
     }
 
     @Test("Routes Universal Links and rejects new links while busy")
+    @MainActor
     func universalLinkFragmentAndBusyGuard() throws {
         let url = try #require(URL(string: "https://totaldrop.app/r#7-harbor-rocket"))
         #expect(IOSAppModel.parseLinkCode(url, bridge: bridge) == "7-harbor-rocket")
@@ -55,6 +56,7 @@ struct MobileBridgeTests {
     }
 
     @Test("Extracts clipboard codes and formats VoiceOver pauses via Rust")
+    @MainActor
     func clipboardAndVoiceOver() throws {
         let extracted = try #require(
             bridge.extractClipboardCode("Get my files: https://totaldrop.app/r#7-harbor-rocket")
