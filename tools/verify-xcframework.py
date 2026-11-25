@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import plistlib
+import struct
 import subprocess
 import sys
 import tempfile
@@ -59,8 +60,12 @@ REQUIRED_EXPORTED_SYMBOLS: tuple[str, ...] = (
 )
 
 
+def _normalize_darwin_symbol(raw: str) -> str:
+    return raw[1:] if raw.startswith("_") else raw
+
+
 def parse_nm_exported_symbols(nm_stdout: str) -> set[str]:
-    """Extract normalized C symbol names (stripping Darwin leading `_`) from `nm -gU` output."""
+    """Extract defined external C symbol names (stripping Darwin leading `_`) from `nm -g` output."""
     symbols: set[str] = set()
     for raw_line in nm_stdout.splitlines():
         line = raw_line.strip()
@@ -69,11 +74,92 @@ def parse_nm_exported_symbols(nm_stdout: str) -> set[str]:
         parts = line.split()
         if len(parts) < 2:
             continue
-        sym = parts[-1]
-        if sym.startswith("_"):
-            sym = sym[1:]
-        symbols.add(sym)
+        sym_type = parts[-2]
+        if len(sym_type) != 1 or not sym_type.isupper() or sym_type == "U":
+            continue
+        symbols.add(_normalize_darwin_symbol(parts[-1]))
     return symbols
+
+
+def parse_darwin_archive_symdef(archive_bytes: bytes) -> set[str]:
+    """Read exported external symbols from a single-arch Darwin BSD `__.SYMDEF` archive table."""
+    if not archive_bytes.startswith(b"!<arch>\n"):
+        return set()
+    offset = 8
+    while offset + 60 <= len(archive_bytes):
+        header = archive_bytes[offset : offset + 60]
+        if header[58:60] != b"`\n":
+            break
+        raw_name = header[0:16].decode("ascii", errors="replace").rstrip(" ")
+        size_str = header[48:58].decode("ascii", errors="replace").strip()
+        try:
+            member_size = int(size_str)
+        except ValueError:
+            break
+        data_start = offset + 60
+        data_end = data_start + member_size
+        if data_end > len(archive_bytes):
+            break
+        member_data = archive_bytes[data_start:data_end]
+        member_name = raw_name
+        if raw_name.startswith("#1/"):
+            try:
+                ext_len = int(raw_name[3:])
+            except ValueError:
+                ext_len = 0
+            if 0 < ext_len <= len(member_data):
+                member_name = (
+                    member_data[:ext_len].split(b"\x00", 1)[0].decode("ascii", errors="replace")
+                )
+                member_data = member_data[ext_len:]
+        if member_name in ("__.SYMDEF", "__.SYMDEF SORTED", "__.SYMDEF_64", "__.SYMDEF_64 SORTED"):
+            is_64 = "_64" in member_name
+            fmt = "<Q" if is_64 else "<I"
+            word = 8 if is_64 else 4
+            if len(member_data) < word:
+                return set()
+            ranlib_bytes = struct.unpack_from(fmt, member_data, 0)[0]
+            strtab_len_off = word + ranlib_bytes
+            if strtab_len_off + word > len(member_data):
+                return set()
+            strtab_size = struct.unpack_from(fmt, member_data, strtab_len_off)[0]
+            strtab_start = strtab_len_off + word
+            strtab = member_data[strtab_start : strtab_start + strtab_size]
+            symbols: set[str] = set()
+            for entry in strtab.split(b"\x00"):
+                if not entry:
+                    continue
+                symbols.add(_normalize_darwin_symbol(entry.decode("utf-8", errors="replace")))
+            return symbols
+        offset = data_end + (data_end & 1)
+    return set()
+
+
+def _extract_native_slice_symbols(
+    lib_path: Path, arch: str, is_fat: bool
+) -> tuple[set[str], str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        inspect_path = lib_path
+        if is_fat:
+            inspect_path = Path(tmp) / f"{arch}-{lib_path.name}"
+            subprocess.check_call(
+                ["lipo", "-thin", arch, str(lib_path), "-output", str(inspect_path)]
+            )
+
+        symdef_syms = parse_darwin_archive_symdef(inspect_path.read_bytes())
+        nm_proc = subprocess.run(
+            ["xcrun", "nm", "-g", str(inspect_path)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        nm_syms = parse_nm_exported_symbols(nm_proc.stdout)
+        exported = symdef_syms | nm_syms
+        diag = (
+            f"symdef={len(symdef_syms)}, nm={len(nm_syms)}, "
+            f"nm_rc={nm_proc.returncode}, nm_stderr={nm_proc.stderr.strip()[:240]!r}"
+        )
+        return exported, diag
 
 
 def verify_xcframework(
@@ -169,24 +255,18 @@ def verify_xcframework(
                     f"slice {slice_id}: lipo -archs {sorted(actual_archs)} != {sorted(expected_archs)}"
                 )
 
+            is_fat = len(expected_archs) > 1
             for arch in sorted(expected_archs):
-                nm_proc = subprocess.run(
-                    ["nm", "-gU", "-arch", arch, str(lib_path)],
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-                if not nm_proc.stdout.strip():
+                exported, diag = _extract_native_slice_symbols(lib_path, arch, is_fat)
+                if not exported:
                     raise ValueError(
-                        f"slice {slice_id} ({arch}): nm -gU produced no symbol output "
-                        f"(rc={nm_proc.returncode}, stderr={nm_proc.stderr.strip()!r})"
+                        f"slice {slice_id} ({arch}): no exported symbols found ({diag})"
                     )
-                exported = parse_nm_exported_symbols(nm_proc.stdout)
                 missing_syms = [s for s in REQUIRED_EXPORTED_SYMBOLS if s not in exported]
                 if missing_syms:
                     raise ValueError(
                         f"slice {slice_id} ({arch}): missing exported C ABI symbols: "
-                        f"{', '.join(missing_syms)}"
+                        f"{', '.join(missing_syms)} ({diag})"
                     )
 
         verified_slices.append(f"{slice_id}({','.join(sorted(expected_archs))})")
@@ -242,10 +322,30 @@ def write_synthetic_xcframework(root: Path) -> Path:
     return xf
 
 
+def _build_synthetic_darwin_symdef_archive(symbols: list[str], *, use_64: bool = False) -> bytes:
+    member_name = b"__.SYMDEF_64 SORTED\x00" if use_64 else b"__.SYMDEF SORTED\x00\x00\x00\x00"
+    strtab = b"".join(s.encode("utf-8") + b"\x00" for s in symbols)
+    while len(strtab) % 4 != 0:
+        strtab += b"\x00"
+    fmt = "<Q" if use_64 else "<I"
+    ranlib = struct.pack(fmt, 0)
+    payload = member_name + ranlib + struct.pack(fmt, len(strtab)) + strtab
+    name_field = f"#1/{len(member_name)}".ljust(16).encode("ascii")
+    header = (
+        name_field
+        + b"0           0     0     100644  "
+        + f"{len(payload):<10}".encode("ascii")
+        + b"`\n"
+    )
+    return b"!<arch>\n" + header + payload
+
+
 def run_self_test() -> int:
-    # 1. Test nm -gU symbol parser (including universal multi-arch object headers).
+    # 1. Test nm -g symbol parser (filtering undefined U and local lowercase symbols).
     sample_nm = (
         "\nlibtotaldrop_apple_mobile_ffi.a(ffi.o) (for architecture arm64):\n"
+        "                 U _malloc\n"
+        "0000000000000050 t _private_helper\n"
         "0000000000000100 T _totaldrop_mobile_version_json\n"
         "0000000000000200 T _totaldrop_mobile_string_free\n"
         "\nlibtotaldrop_apple_mobile_ffi.a(ffi.o) (for architecture x86_64):\n"
@@ -255,6 +355,19 @@ def run_self_test() -> int:
     assert "totaldrop_mobile_version_json" in parsed
     assert "totaldrop_mobile_string_free" in parsed
     assert "totaldrop_mobile_session_destroy" in parsed
+    assert "malloc" not in parsed
+    assert "private_helper" not in parsed
+
+    # 2. Test Darwin __.SYMDEF and __.SYMDEF_64 archive index parsers.
+    for use_64 in (False, True):
+        archive = _build_synthetic_darwin_symdef_archive(
+            ["_totaldrop_mobile_version_json", "_totaldrop_mobile_string_free"],
+            use_64=use_64,
+        )
+        symdef = parse_darwin_archive_symdef(archive)
+        assert symdef == {"totaldrop_mobile_version_json", "totaldrop_mobile_string_free"}, (
+            f"unexpected symdef (64={use_64}): {symdef}"
+        )
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -262,7 +375,7 @@ def run_self_test() -> int:
         slices = verify_xcframework(xf, require_tvos=False, check_native=False)
         assert len(slices) == 2
 
-        # 2. Tamper header -> must fail.
+        # 3. Tamper header -> must fail.
         bad_hdr = xf / "ios-arm64" / "Headers" / "totaldrop_apple_mobile_ffi.h"
         orig_hdr = bad_hdr.read_bytes()
         bad_hdr.write_bytes(orig_hdr + b"\n/* drifted */\n")
@@ -273,14 +386,14 @@ def run_self_test() -> int:
             assert "drifted" in str(err)
         bad_hdr.write_bytes(orig_hdr)
 
-        # 3. Require tvOS when only iOS slices exist -> must fail.
+        # 4. Require tvOS when only iOS slices exist -> must fail.
         try:
             verify_xcframework(xf, require_tvos=True, check_native=False)
             raise AssertionError("expected missing tvos slice to fail")
         except ValueError as err:
             assert "tvos-arm64" in str(err)
 
-    print("verify-xcframework.py --self-test OK (structural, header parity, tvOS gate & nm parser).")
+    print("verify-xcframework.py --self-test OK (structural, header parity, tvOS gate, nm & __.SYMDEF parsers).")
     return 0
 
 
